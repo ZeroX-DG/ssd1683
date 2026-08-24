@@ -66,6 +66,27 @@ pub enum DeepSleepMode {
     DiscardRAM,
 }
 
+/// 级联双芯片面板中命令的目标芯片。
+///
+/// 部分 SSD1683 面板（例如 792x272 的面板）由两颗级联的 SSD1683 驱动，
+/// 分别驱动面板的左右两半。寻址/写入 RAM 的命令需要通过在命令字节最高位
+/// 置 1 来定向到从芯片；其余全局命令（复位、软复位、刷新等）由主芯片
+/// 转发给从芯片，无需寻址。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chip {
+    Master,
+    Slave,
+}
+
+impl Chip {
+    fn offset(self) -> u8 {
+        match self {
+            Chip::Master => 0x00,
+            Chip::Slave => 0x80,
+        }
+    }
+}
+
 /// 可以发送到控制器的命令。
 #[derive(Clone, Copy)]
 pub enum Command {
@@ -126,6 +147,16 @@ pub enum Command {
 
 impl Command {
     pub fn execute<I: DisplayInterface>(&self, interface: &mut I) -> Result<(), I::Error> {
+        self.execute_on(interface, Chip::Master)
+    }
+
+    /// 执行命令，并将其定向到级联双芯片面板中的指定芯片。
+    /// 对于单芯片面板，等价于 [`Command::execute`]。
+    pub fn execute_on<I: DisplayInterface>(
+        &self,
+        interface: &mut I,
+        chip: Chip,
+    ) -> Result<(), I::Error> {
         use self::Command::*;
 
         let mut buf = [0u8; 4];
@@ -190,7 +221,7 @@ impl Command {
             Nop => pack!(buf, 0x7F, []),
         };
 
-        interface.send_command(command)?;
+        interface.send_command(command | chip.offset())?;
         if data.is_empty() {
             Ok(())
         } else {

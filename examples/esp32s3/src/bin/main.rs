@@ -51,10 +51,19 @@ async fn main(_spawner: Spawner) -> ! {
 
     info!("Embassy initialized!");
 
-    let busy = Input::new(peripherals.GPIO4, InputConfig::default());
-    let reset = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default());
-    let dc = Output::new(peripherals.GPIO9, Level::Low, OutputConfig::default());
-    let cs = Output::new(peripherals.GPIO10, Level::Low, OutputConfig::default());
+    // CrowPanel's e-paper module is not powered by default; GPIO7 must be
+    // driven high to enable it (see Elecrow's own example, `pinMode(7,
+    // OUTPUT); digitalWrite(7, HIGH);`). Without this the panel has no power
+    // at all regardless of what's sent over SPI.
+    let mut epd_power = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
+    epd_power.set_high();
+
+    // Pin mapping per Elecrow's CrowPanel ESP32-S3 5.79" e-paper example
+    // (spi.h): SCK=12 MOSI=11 RES=47 DC=46 CS=45 BUSY=48.
+    let busy = Input::new(peripherals.GPIO48, InputConfig::default());
+    let reset = Output::new(peripherals.GPIO47, Level::Low, OutputConfig::default());
+    let dc = Output::new(peripherals.GPIO46, Level::Low, OutputConfig::default());
+    let cs = Output::new(peripherals.GPIO45, Level::Low, OutputConfig::default());
 
     let spi = Spi::new(
         peripherals.SPI2,
@@ -70,11 +79,19 @@ async fn main(_spawner: Spawner) -> ! {
     let spi_device = ExclusiveDevice::new(spi, cs, Delay::new()).expect("init spi fail");
 
     let epd_interfaces = Interface::new(spi_device, busy, reset, dc);
-    let mut dirty_buffer = [0_u8; ssd1683::BUFFER_SIZE];
-    let mut black_buffer = [0xFF; ssd1683::BUFFER_SIZE];
+
+    // The CrowPanel 5.79" panel is 792x272 physical pixels, driven by two
+    // cascaded SSD1683 controllers (master + mirrored slave), each addressing
+    // 400 px of RAM, for a combined addressable width of 800 px.
+    const CHIP_WIDTH: u16 = 400;
+    const HEIGHT: u16 = 272;
+    let config = ssd1683::Config::new(CHIP_WIDTH, HEIGHT).with_cascade(CHIP_WIDTH);
+
+    let mut dirty_buffer = [0_u8; ssd1683::buffer_size(CHIP_WIDTH * 2, HEIGHT)];
+    let mut black_buffer = [0xFF; ssd1683::buffer_size(CHIP_WIDTH * 2, HEIGHT)];
     let mut display = Graphics::new(
         epd_interfaces,
-        ssd1683::Config::default(),
+        config,
         Delay::new(),
         &mut dirty_buffer,
         &mut black_buffer,
