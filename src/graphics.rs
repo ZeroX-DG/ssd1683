@@ -100,6 +100,10 @@ where
         }
         self.dirty_buffer.iter_mut().for_each(|d| *d = 0);
         self.update_count += 1;
+        // MasterActivation 返回（BUSY 拉低）只表示控制器已启动波形，面板像素
+        // 本身还在稳定过程中。若立即进入深度睡眠会切断电荷泵，这一帧的图像
+        // 就不会真正显示出来。先留出稳定时间再睡眠。
+        self.delay.delay_ms(200);
         self.deep_sleep(DeepSleepMode::PreserveRAM)?;
         Ok(())
     }
@@ -198,26 +202,28 @@ where
 
     /// 一颗芯片在帧缓冲区中负责的字节列范围（闭区间）。
     ///
-    /// 面板的真实几何由参考实现的 `Paint_SetPixel`（Rotation=180）与
-    /// `EPD_Display` 复合推导得到：**从芯片驱动逻辑左半屏，主芯片驱动逻辑
-    /// 右半屏**（与直觉相反），且主芯片左右镜像。
+    /// 对应参考实现 `EPD_Display`：主芯片循环先跑完 `tempcol` 0..=chip_bytes-1，
+    /// 从芯片循环**不重置** `tempcol`/`templine`，紧接着继续读取后半段列。
+    /// 因此主芯片驱动帧缓冲区的左半屏，从芯片驱动右半屏。
     fn cascade_chip_cols(&self, chip: Chip, chip_bytes: u8) -> (usize, usize) {
         let stride = (self.config.width / 8) as usize;
         match chip {
-            Chip::Slave => (0, chip_bytes as usize - 1),
-            Chip::Master => (chip_bytes as usize, stride - 1),
+            Chip::Master => (0, chip_bytes as usize - 1),
+            Chip::Slave => (chip_bytes as usize, stride - 1),
         }
     }
 
     /// 将帧缓冲区中属于 `chip` 的半屏写入它的 RAM(BW)。
     ///
-    /// 驱动对外保持 `Rotation::Rotate0` 的直觉坐标系（左上角为原点、字节内
-    /// MSB 在左），面板所需的 180° 方向差异在这里吸收：
-    /// - RAM Y 等于帧缓冲区行号；扫描按 Y 递减进行，故行自 height-1 递减发送。
-    /// - 从芯片 RAM X = 帧缓冲区列号；主芯片 RAM X = (stride-1) - 列号（镜像）。
-    ///   两者的扫描顺序都对应帧缓冲区列号自高向低。
-    /// - 面板每个 RAM 字节内的位序与帧缓冲区相反（LSB 对应最左像素），
-    ///   因此每个字节发送前按位反转。
+    /// 逐字节对应参考实现 `EPD_Display` 的取数循环：
+    /// ```c
+    /// tempOriginal = *(ImageBW + templine * Source_BYTES * 2 + tempcol);
+    /// templine++; if (templine >= Gate_BITS) { tempcol++; templine = 0; }
+    /// EPD_WR_DATA8(tempOriginal);
+    /// ```
+    /// 即：列优先（AM=Y），列号与行号均**递增**，字节按原样发送（不做位反转）。
+    /// 面板所需的 180° 方向由参考实现在绘制阶段（`Paint_SetPixel`，
+    /// `#define Rotation 180`）写入缓冲区时完成，而不在这里的传输循环中处理。
     fn write_cascade_chip_frame(
         &mut self,
         chip: Chip,
@@ -232,9 +238,9 @@ where
 
         let mut chunk = [0u8; 256];
         let mut filled = 0;
-        for col in (col_lo..=col_hi).rev() {
-            for row in (0..height).rev() {
-                chunk[filled] = self.black_buffer[row * stride + col].reverse_bits();
+        for col in col_lo..=col_hi {
+            for row in 0..height {
+                chunk[filled] = self.black_buffer[row * stride + col];
                 filled += 1;
                 if filled == chunk.len() {
                     self.interface.send_data(&chunk)?;
@@ -259,16 +265,49 @@ where
         Ok(())
     }
 
-    /// 为级联面板中的一颗芯片寻址并将其某个 RAM 平面整体填充为常数 `value`。
+    /// 只设置一颗芯片的 RAM 地址计数器（0x4E/0x4F，从芯片 0xCE/0xCF），
+    /// 不重设数据输入模式与 X/Y 窗口。对应参考实现的 `EPD_SetRAMMA` /
+    /// `EPD_SetRAMSA`。
+    ///
+    /// 与 [`Self::address_cascade_chip`]（对应 `EPD_SetRAMMP` + `EPD_SetRAMMA`，
+    /// 会额外发送 0x11/0x44/0x45）的区别很关键：参考实现在一次窗口设置之后
+    /// 连续写入多个 RAM 平面时，后续平面只重设地址计数器而**不**重发
+    /// 数据输入模式和窗口（见 `EPD_Display_Clear` 中第二次 0x26 之前只调用
+    /// `EPD_SetRAMMA`，以及整个 `EPD_Clear_R26A6H`）。
+    fn set_cascade_chip_ram_address(
+        &mut self,
+        chip: Chip,
+        chip_bytes: u8,
+    ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
+        let y_last = self.config.height.saturating_sub(1);
+        let x_addr = match chip {
+            Chip::Master => 0,
+            Chip::Slave => chip_bytes - 1,
+        };
+        Command::XAddress(x_addr).execute_on(&mut self.interface, chip)?;
+        Command::YAddress(y_last).execute_on(&mut self.interface, chip)?;
+        Ok(())
+    }
+
+    /// 将一颗芯片的某个 RAM 平面整体填充为常数 `value`。
     /// 填充值是常数，因此与扫描方向和位序无关。
+    ///
+    /// `reset_window` 控制寻址方式：`true` 时发送完整的窗口设置
+    /// （`EPD_SetRAMMP` + `EPD_SetRAMMA`），`false` 时只重设地址计数器
+    /// （`EPD_SetRAMMA`），以匹配参考实现在连续写入多个平面时的行为。
     fn fill_cascade_chip_plane(
         &mut self,
         chip: Chip,
         chip_bytes: u8,
         write_cmd: Command,
         value: u8,
+        reset_window: bool,
     ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
-        self.address_cascade_chip(chip, chip_bytes)?;
+        if reset_window {
+            self.address_cascade_chip(chip, chip_bytes)?;
+        } else {
+            self.set_cascade_chip_ram_address(chip, chip_bytes)?;
+        }
 
         let chunk = [value; 256];
         let mut remaining = chip_bytes as usize * self.config.height as usize;
@@ -292,22 +331,17 @@ where
     ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
         self.cascade_fast_mode1_init()?;
 
+        // 对应 EPD_Display_Clear：每颗芯片先做一次完整窗口设置
+        // （SetRAMMP + SetRAMMA）写 RAM(BW)，随后写 RAM(RED) 时只重设
+        // 地址计数器（SetRAMMA），不重发数据输入模式与窗口。
         let chip_bytes = (cascade.chip_width / 8) as u8;
         for chip in [Chip::Master, Chip::Slave] {
-            self.fill_cascade_chip_plane(chip, chip_bytes, Command::WriteRamBW, 0xFF)?;
-            self.fill_cascade_chip_plane(chip, chip_bytes, Command::WriteRamRed, 0x00)?;
+            self.fill_cascade_chip_plane(chip, chip_bytes, Command::WriteRamBW, 0xFF, true)?;
+            self.fill_cascade_chip_plane(chip, chip_bytes, Command::WriteRamRed, 0x00, false)?;
         }
         Command::DisplayUpdateControl2(0xF7).execute(&mut self.interface)?;
         Command::MasterActivation.execute(&mut self.interface)?;
         self.interface.busy_wait();
-
-        // 全刷之后把 RAM(RED) 置为 0xFF（白），使其与屏幕当前的空白状态一致。
-        // 局刷是以 RAM(RED) 作为"旧图"、RAM(BW) 作为"新图"做差分的，若 RAM(RED)
-        // 仍是全刷时写入的 0x00（黑），后续局刷的起点就与屏幕实际内容不符。
-        // 对应参考实现 EPD_Clear_R26A6H（5.79_PWR / 5.79_key 在全刷后调用）。
-        for chip in [Chip::Master, Chip::Slave] {
-            self.fill_cascade_chip_plane(chip, chip_bytes, Command::WriteRamRed, 0xFF)?;
-        }
         Ok(())
     }
 

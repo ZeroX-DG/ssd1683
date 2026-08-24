@@ -45,7 +45,7 @@ async fn main(_spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
+    esp_alloc::heap_allocator!(size: 64 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
@@ -99,7 +99,7 @@ async fn main(_spawner: Spawner) -> ! {
     );
     info!("epd device ready");
 
-    display.clear(EpdColor::White).unwrap();
+    display.clear(EpdColor::Black).unwrap();
 
     let style = MonoTextStyleBuilder::new()
         .font(&embedded_graphics::mono_font::ascii::FONT_6X10)
@@ -108,21 +108,36 @@ async fn main(_spawner: Spawner) -> ! {
         .build();
     let text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
 
-    let _ = Text::with_text_style(
-        "update start text test",
-        Point::new(50, 250),
-        style,
-        text_style,
-    )
-    .draw(&mut display);
+    // Geometry check. The panel is 800 px addressable but only 792 visible:
+    // the two controllers meet at a dead 8-column seam spanning x=396..=403,
+    // so right-hand content starts at x=404 to stay on screen.
+    //
+    // Each corner is labelled, which pins down every axis of the cascade
+    // mapping at once. If all four labels sit in the corner they name and
+    // read normally, then the half assignment, the mirroring, the vertical
+    // direction and the in-byte bit order are all correct. Anything wrong
+    // shows up as a specific, recognisable failure: labels on the wrong
+    // side, reading right-to-left, top/bottom swapped, or scrambled glyphs.
+    const RIGHT_X: i32 = 799 - 9 * 6; // widest label is 9 chars of FONT_6X10
+    const BOTTOM_Y: i32 = 272 - 10;
+    for (label, point) in [
+        ("TOP-LEFT", Point::new(2, 2)),
+        ("TOP-RIGHT", Point::new(RIGHT_X, 2)),
+        ("BOTTOM-LEFT", Point::new(2, BOTTOM_Y)),
+        ("BOTTOM-RIGHT", Point::new(RIGHT_X - 3 * 6, BOTTOM_Y)),
+    ] {
+        let _ = Text::with_text_style(label, point, style, text_style).draw(&mut display);
+    }
 
     info!("update start");
     display.update().expect("display error");
     info!("update done");
 
+    // Second update touches only a small central area, so it takes the
+    // partial-refresh path rather than the full/fast one above.
     let _ = Text::with_text_style(
         "partial update test",
-        Point::new(50, 100),
+        Point::new(150, 130),
         style,
         text_style,
     )
