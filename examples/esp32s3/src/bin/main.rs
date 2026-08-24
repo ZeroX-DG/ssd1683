@@ -12,6 +12,7 @@ extern crate alloc;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use embedded_graphics::Drawable;
+use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::prelude::Point;
 use embedded_graphics::text::{Baseline, Text, TextStyleBuilder};
@@ -98,6 +99,8 @@ async fn main(_spawner: Spawner) -> ! {
     );
     info!("epd device ready");
 
+    display.clear(EpdColor::White).unwrap();
+
     let style = MonoTextStyleBuilder::new()
         .font(&embedded_graphics::mono_font::ascii::FONT_6X10)
         .text_color(EpdColor::Black)
@@ -118,7 +121,7 @@ async fn main(_spawner: Spawner) -> ! {
     info!("update done");
 
     let _ = Text::with_text_style(
-        "part update test display error",
+        "partial update test",
         Point::new(50, 100),
         style,
         text_style,

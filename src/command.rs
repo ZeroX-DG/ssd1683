@@ -110,8 +110,11 @@ pub enum Command {
     /// 0x18: 读取温度传感器寄存器
     /// a[7:0]: 0x48=外部温度传感器；0x80=内部温度传感器
     ReadTemperatureSensor(u8),
-    /// 0x1A: 写入温度传感器寄存器
+    /// 0x1A: 写入温度传感器寄存器（单字节简化形式）
     WriteTemperatureSensor(u8),
+    /// 0x1A: 写入温度传感器寄存器（双字节形式）
+    /// 级联双芯片面板的快刷模式初始化（EPD_FastMode1Init）会写入两个字节。
+    WriteTemperatureRegister(u8, u8),
     /// 0x20: 激活显示更新序列。执行期间 BUSY 信号将保持高电平。
     MasterActivation,
     /// 0x21: 显示更新控制1
@@ -196,6 +199,9 @@ impl Command {
             ReadTemperatureSensor(data) => pack!(buf, 0x18, [data]),
             WriteTemperatureSensor(data) => {
                 pack!(buf, 0x1A, [data])
+            }
+            WriteTemperatureRegister(byte0, byte1) => {
+                pack!(buf, 0x1A, [byte0, byte1])
             }
             MasterActivation => pack!(buf, 0x20, []),
             DisplayUpdateControl1(data) => {
