@@ -221,8 +221,10 @@ impl Command {
             }
             XAddress(address) => pack!(buf, 0x4E, [address]),
             YAddress(address) => {
+                // 与 0x45 一致，控制器期望低字节在前（参考实现 0x4F ← 0x0F, 0x01
+                // 表示 Y=0x010F=271）。此前按高字节在前发送，只有 Y=0 时才恰好正确。
                 let [upper, lower] = address.to_be_bytes();
-                pack!(buf, 0x4F, [upper, lower])
+                pack!(buf, 0x4F, [lower, upper])
             }
             Nop => pack!(buf, 0x7F, []),
         };

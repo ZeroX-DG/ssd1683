@@ -165,127 +165,114 @@ where
         Ok(())
     }
 
-    /// 寻址并写入级联双芯片面板整帧的黑白 RAM：主芯片负责左半部分
-    /// （地址递增），从芯片负责右半部分（相对主芯片左右镜像，地址递减）。
-    fn write_cascade_frame(
-        &mut self,
-        cascade: CascadeConfig,
-    ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
-        let chip_width_bytes = (cascade.chip_width / 8) as u8;
-        let y_end = self.config.height.saturating_sub(1);
-        self.write_cascade_chip_ram(Chip::Master, 0, chip_width_bytes - 1, 0, y_end)?;
-        self.write_cascade_chip_ram(
-            Chip::Slave,
-            chip_width_bytes,
-            chip_width_bytes * 2 - 1,
-            0,
-            y_end,
-        )?;
-        Ok(())
-    }
-
-    /// 级联面板中一颗芯片自己的 RAM X 地址空间在帧缓冲区中的字节列起点。
-    /// 每颗 SSD1683 只拥有 `chip_width / 8` 个字节列（例如 400px → 0..=49），
-    /// 因此从芯片的帧缓冲区列号必须减去该偏移才能作为它自己的 RAM X 地址。
-    fn chip_col_offset(&self, chip: Chip) -> u8 {
-        match (chip, self.config.cascade) {
-            (Chip::Slave, Some(cascade)) => (cascade.chip_width / 8) as u8,
-            _ => 0,
-        }
-    }
-
-    /// 为级联面板中的一颗芯片设置 RAM 寻址窗口（X/Y 起止位置与地址计数器）。
-    /// `col_start`/`col_end` 是相对整个帧缓冲区（而非单颗芯片）的字节列范围，
-    /// 在写入 RAM X 相关寄存器前会先转换为该芯片自己的本地地址。
-    fn address_cascade_chip_ram(
+    /// 为级联面板中的一颗芯片设置它自己完整的 RAM 寻址窗口。
+    ///
+    /// 忠实移植参考实现的 `EPD_SetRAMMP`/`EPD_SetRAMMA`（主芯片）与
+    /// `EPD_SetRAMSP`/`EPD_SetRAMSA`（从芯片）：两颗芯片都工作在 AM=Y
+    /// （列优先）、Y 递减模式，主芯片 X 递增（0x11 ← 0x05），从芯片 X 递减
+    /// （0x91 ← 0x04）。每颗芯片的 RAM X 都是它自己的 0..=chip_bytes-1。
+    fn address_cascade_chip(
         &mut self,
         chip: Chip,
-        col_start: u8,
-        col_end: u8,
-        y_start: u16,
-        y_end: u16,
+        chip_bytes: u8,
     ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
-        // 每颗芯片的 RAM X 地址都从 0 开始，因此这里必须把帧缓冲区列号
-        // 转换为芯片本地列号，否则从芯片会被寻址到自身范围之外
-        // （参考实现给从芯片写的是 0xC4 ← 0x31/0x00，即本地的 49..0）。
-        let offset = self.chip_col_offset(chip);
-        let local_start = col_start.saturating_sub(offset);
-        let local_end = col_end.saturating_sub(offset);
-
-        // 两颗芯片在物理面板上左右镜像安装，其中一颗的地址递增方向与
-        // 帧缓冲区的列顺序相反，因此 X 起止位置互换、X 方向改为递减。
-        // 经实机验证：offset=0x00（此处标记为 Master）的芯片是需要
-        // 镜像（递减）寻址的那一颗，offset=0x80（Slave）按正常方向寻址。
+        let y_last = self.config.height.saturating_sub(1);
         let (mode, x_start, x_end, x_addr) = match chip {
-            Chip::Master => (
-                DataEntryMode::DecrementXIncrementY,
-                local_end,
-                local_start,
-                local_end,
-            ),
+            Chip::Master => (DataEntryMode::IncrementXDecrementY, 0, chip_bytes - 1, 0),
             Chip::Slave => (
-                DataEntryMode::IncrementYIncrementX,
-                local_start,
-                local_end,
-                local_start,
+                DataEntryMode::DecrementXDecrementY,
+                chip_bytes - 1,
+                0,
+                chip_bytes - 1,
             ),
         };
-        Command::DataEntryMode(mode, IncrementAxis::Horizontal)
+        Command::DataEntryMode(mode, IncrementAxis::Vertical)
             .execute_on(&mut self.interface, chip)?;
         Command::StartEndXPosition(x_start, x_end).execute_on(&mut self.interface, chip)?;
-        Command::StartEndYPosition(y_start, y_end).execute_on(&mut self.interface, chip)?;
+        Command::StartEndYPosition(y_last, 0).execute_on(&mut self.interface, chip)?;
         Command::XAddress(x_addr).execute_on(&mut self.interface, chip)?;
-        Command::YAddress(y_start).execute_on(&mut self.interface, chip)?;
+        Command::YAddress(y_last).execute_on(&mut self.interface, chip)?;
         self.interface.busy_wait();
         Ok(())
     }
 
-    /// 为级联面板中的一颗芯片寻址并写入其黑白 RAM 窗口。
-    /// `col_start`/`col_end` 是相对整个帧缓冲区（而非单颗芯片）的字节列范围。
-    fn write_cascade_chip_ram(
+    /// 一颗芯片在帧缓冲区中负责的字节列范围（闭区间）。
+    ///
+    /// 面板的真实几何由参考实现的 `Paint_SetPixel`（Rotation=180）与
+    /// `EPD_Display` 复合推导得到：**从芯片驱动逻辑左半屏，主芯片驱动逻辑
+    /// 右半屏**（与直觉相反），且主芯片左右镜像。
+    fn cascade_chip_cols(&self, chip: Chip, chip_bytes: u8) -> (usize, usize) {
+        let stride = (self.config.width / 8) as usize;
+        match chip {
+            Chip::Slave => (0, chip_bytes as usize - 1),
+            Chip::Master => (chip_bytes as usize, stride - 1),
+        }
+    }
+
+    /// 将帧缓冲区中属于 `chip` 的半屏写入它的 RAM(BW)。
+    ///
+    /// 驱动对外保持 `Rotation::Rotate0` 的直觉坐标系（左上角为原点、字节内
+    /// MSB 在左），面板所需的 180° 方向差异在这里吸收：
+    /// - RAM Y 等于帧缓冲区行号；扫描按 Y 递减进行，故行自 height-1 递减发送。
+    /// - 从芯片 RAM X = 帧缓冲区列号；主芯片 RAM X = (stride-1) - 列号（镜像）。
+    ///   两者的扫描顺序都对应帧缓冲区列号自高向低。
+    /// - 面板每个 RAM 字节内的位序与帧缓冲区相反（LSB 对应最左像素），
+    ///   因此每个字节发送前按位反转。
+    fn write_cascade_chip_frame(
         &mut self,
         chip: Chip,
-        col_start: u8,
-        col_end: u8,
-        y_start: u16,
-        y_end: u16,
+        chip_bytes: u8,
     ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
-        self.address_cascade_chip_ram(chip, col_start, col_end, y_start, y_end)?;
-
-        let region = DirtyRect {
-            min_byte_col: col_start,
-            max_byte_col: col_end,
-            min_y: y_start,
-            max_y: y_end,
-        };
+        self.address_cascade_chip(chip, chip_bytes)?;
         Command::WriteRamBW.execute_on(&mut self.interface, chip)?;
-        for row in RegionIterator::new(self.black_buffer, self.config.width as usize, &region) {
-            self.interface.send_data(row)?;
+
+        let stride = (self.config.width / 8) as usize;
+        let height = self.config.height as usize;
+        let (col_lo, col_hi) = self.cascade_chip_cols(chip, chip_bytes);
+
+        let mut chunk = [0u8; 256];
+        let mut filled = 0;
+        for col in (col_lo..=col_hi).rev() {
+            for row in (0..height).rev() {
+                chunk[filled] = self.black_buffer[row * stride + col].reverse_bits();
+                filled += 1;
+                if filled == chunk.len() {
+                    self.interface.send_data(&chunk)?;
+                    filled = 0;
+                }
+            }
+        }
+        if filled > 0 {
+            self.interface.send_data(&chunk[..filled])?;
         }
         Ok(())
     }
 
-    /// 为级联面板中的一颗芯片寻址并将其指定 RAM 平面窗口填充为常数 `value`。
+    /// 寻址并写入级联双芯片面板的整帧黑白 RAM。
+    fn write_cascade_frame(
+        &mut self,
+        cascade: CascadeConfig,
+    ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
+        let chip_bytes = (cascade.chip_width / 8) as u8;
+        self.write_cascade_chip_frame(Chip::Master, chip_bytes)?;
+        self.write_cascade_chip_frame(Chip::Slave, chip_bytes)?;
+        Ok(())
+    }
+
+    /// 为级联面板中的一颗芯片寻址并将其某个 RAM 平面整体填充为常数 `value`。
+    /// 填充值是常数，因此与扫描方向和位序无关。
     fn fill_cascade_chip_plane(
         &mut self,
         chip: Chip,
-        region: &DirtyRect,
+        chip_bytes: u8,
         write_cmd: Command,
         value: u8,
     ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
-        self.address_cascade_chip_ram(
-            chip,
-            region.min_byte_col,
-            region.max_byte_col,
-            region.min_y,
-            region.max_y,
-        )?;
+        self.address_cascade_chip(chip, chip_bytes)?;
 
-        let chunk = [value; 32];
-        let total_bytes = (region.max_byte_col - region.min_byte_col + 1) as usize
-            * (region.max_y - region.min_y + 1) as usize;
+        let chunk = [value; 256];
+        let mut remaining = chip_bytes as usize * self.config.height as usize;
         write_cmd.execute_on(&mut self.interface, chip)?;
-        let mut remaining = total_bytes;
         while remaining > 0 {
             let n = remaining.min(chunk.len());
             self.interface.send_data(&chunk[..n])?;
@@ -305,20 +292,10 @@ where
     ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
         self.cascade_fast_mode1_init()?;
 
-        let chip_width_bytes = (cascade.chip_width / 8) as u8;
-        let y_end = self.config.height.saturating_sub(1);
-        for (chip, col_start, col_end) in [
-            (Chip::Master, 0u8, chip_width_bytes - 1),
-            (Chip::Slave, chip_width_bytes, chip_width_bytes * 2 - 1),
-        ] {
-            let region = DirtyRect {
-                min_byte_col: col_start,
-                max_byte_col: col_end,
-                min_y: 0,
-                max_y: y_end,
-            };
-            self.fill_cascade_chip_plane(chip, &region, Command::WriteRamBW, 0xFF)?;
-            self.fill_cascade_chip_plane(chip, &region, Command::WriteRamRed, 0x00)?;
+        let chip_bytes = (cascade.chip_width / 8) as u8;
+        for chip in [Chip::Master, Chip::Slave] {
+            self.fill_cascade_chip_plane(chip, chip_bytes, Command::WriteRamBW, 0xFF)?;
+            self.fill_cascade_chip_plane(chip, chip_bytes, Command::WriteRamRed, 0x00)?;
         }
         Command::DisplayUpdateControl2(0xF7).execute(&mut self.interface)?;
         Command::MasterActivation.execute(&mut self.interface)?;
@@ -328,17 +305,8 @@ where
         // 局刷是以 RAM(RED) 作为"旧图"、RAM(BW) 作为"新图"做差分的，若 RAM(RED)
         // 仍是全刷时写入的 0x00（黑），后续局刷的起点就与屏幕实际内容不符。
         // 对应参考实现 EPD_Clear_R26A6H（5.79_PWR / 5.79_key 在全刷后调用）。
-        for (chip, col_start, col_end) in [
-            (Chip::Master, 0u8, chip_width_bytes - 1),
-            (Chip::Slave, chip_width_bytes, chip_width_bytes * 2 - 1),
-        ] {
-            let region = DirtyRect {
-                min_byte_col: col_start,
-                max_byte_col: col_end,
-                min_y: 0,
-                max_y: y_end,
-            };
-            self.fill_cascade_chip_plane(chip, &region, Command::WriteRamRed, 0xFF)?;
+        for chip in [Chip::Master, Chip::Slave] {
+            self.fill_cascade_chip_plane(chip, chip_bytes, Command::WriteRamRed, 0xFF)?;
         }
         Ok(())
     }
