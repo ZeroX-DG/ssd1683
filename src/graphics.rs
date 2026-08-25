@@ -576,8 +576,12 @@ where
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
+        let size = self.size();
         for pixel in pixels {
             let Pixel(Point { x, y }, color) = pixel;
+            if x < 0 || y < 0 || x as u32 >= size.width || y as u32 >= size.height {
+                continue;
+            }
             self.set_pixel(x as u32, y as u32, color);
         }
         Ok(())
