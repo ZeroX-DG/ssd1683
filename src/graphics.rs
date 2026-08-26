@@ -34,6 +34,12 @@ where
     config: Config,
     delay: DELAY,
     update_count: usize,
+    /// 是否在每次 `update` 之后自动进入深度睡眠（默认开启）。
+    ///
+    /// 注意：级联面板的各条刷新路径都以硬件复位 + 重新初始化开头
+    /// （`cascade_fast_mode1_init`），复位正是初始化序列的前半部分。因此关闭
+    /// 自动睡眠**不会**让局刷跳过复位，只是省去每帧结束时的睡眠调用。
+    auto_sleep: bool,
     dirty_buffer: &'buf mut [u8],
     black_buffer: &'buf mut [u8],
     #[cfg(feature = "use_red")]
@@ -65,6 +71,7 @@ where
             config,
             delay,
             update_count: 0,
+            auto_sleep: true,
             dirty_buffer,
             black_buffer,
             #[cfg(feature = "use_red")]
@@ -104,8 +111,19 @@ where
         // 本身还在稳定过程中。若立即进入深度睡眠会切断电荷泵，这一帧的图像
         // 就不会真正显示出来。先留出稳定时间再睡眠。
         self.delay.delay_ms(200);
-        self.deep_sleep(DeepSleepMode::PreserveRAM)?;
+        if self.auto_sleep {
+            self.deep_sleep(DeepSleepMode::PreserveRAM)?;
+        }
         Ok(())
+    }
+
+    /// 控制每次 [`Self::update`] 之后是否自动进入深度睡眠（默认开启）。
+    ///
+    /// 关闭后面板在两次 `update` 之间保持供电，省去每帧的睡眠/唤醒开销，
+    /// 代价是持续耗电；进入长时间空闲前应显式调用 [`Self::deep_sleep`]。
+    /// 这不会改变刷新路径自身的复位与初始化行为。
+    pub fn set_auto_sleep(&mut self, auto_sleep: bool) {
+        self.auto_sleep = auto_sleep;
     }
 
     fn update_normal(&mut self) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
@@ -265,6 +283,58 @@ where
         Ok(())
     }
 
+    /// 将刚刚显示的整帧写入两颗芯片的 RAM(RED)，作为下一次局刷的差分基准。
+    ///
+    /// 局刷由控制器计算 RAM(RED)（基准图）到 RAM(BW)（新图）的像素跃迁。
+    /// 若基准图始终停留在开机清屏时的内容，每次局刷都会与一张过时的图做差分，
+    /// 已被擦除的文字会被反复重新驱动，表现为"旧内容重新浮现后再缓慢消退"。
+    /// 对应参考实现的 `EPD_SetRAMValue_BaseMap`——它把同一张图同时写入 0x24 与
+    /// 0x26，其注释强调"这个函数是必要的，请不要删除！！！"。
+    ///
+    /// 这里在刷新**之后**同步基准，使 RAM(RED) 始终等于面板上的当前图像。
+    fn sync_cascade_baseline(
+        &mut self,
+        cascade: CascadeConfig,
+    ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
+        let chip_bytes = (cascade.chip_width / 8) as u8;
+        self.write_cascade_chip_baseline(Chip::Master, chip_bytes)?;
+        self.write_cascade_chip_baseline(Chip::Slave, chip_bytes)?;
+        Ok(())
+    }
+
+    /// 将帧缓冲区中属于 `chip` 的半屏写入它的 RAM(RED) 基准平面。
+    /// 取数循环与 [`Self::write_cascade_chip_frame`] 完全一致，只是目标平面
+    /// 换成 0x26。
+    fn write_cascade_chip_baseline(
+        &mut self,
+        chip: Chip,
+        chip_bytes: u8,
+    ) -> Result<(), Error<SPI::Error, RESET::Error, DC::Error>> {
+        self.address_cascade_chip(chip, chip_bytes)?;
+        Command::WriteRamRed.execute_on(&mut self.interface, chip)?;
+
+        let stride = (self.config.width / 8) as usize;
+        let height = self.config.height as usize;
+        let (col_lo, col_hi) = self.cascade_chip_cols(chip, chip_bytes);
+
+        let mut chunk = [0u8; 256];
+        let mut filled = 0;
+        for col in col_lo..=col_hi {
+            for row in 0..height {
+                chunk[filled] = self.black_buffer[row * stride + col];
+                filled += 1;
+                if filled == chunk.len() {
+                    self.interface.send_data(&chunk)?;
+                    filled = 0;
+                }
+            }
+        }
+        if filled > 0 {
+            self.interface.send_data(&chunk[..filled])?;
+        }
+        Ok(())
+    }
+
     /// 只设置一颗芯片的 RAM 地址计数器（0x4E/0x4F，从芯片 0xCE/0xCF），
     /// 不重设数据输入模式与 X/Y 窗口。对应参考实现的 `EPD_SetRAMMA` /
     /// `EPD_SetRAMSA`。
@@ -386,6 +456,8 @@ where
         Command::DisplayUpdateControl2(0xC7).execute(&mut self.interface)?;
         Command::MasterActivation.execute(&mut self.interface)?;
         self.interface.busy_wait();
+        // 刷新完成后同步差分基准，使随后的局刷与面板当前图像做差分。
+        self.sync_cascade_baseline(cascade)?;
         Ok(())
     }
 

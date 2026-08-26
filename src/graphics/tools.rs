@@ -36,6 +36,7 @@ pub fn calculate_dirty_area(buffer: &[u8], width: u32) -> Option<DirtyRect> {
 
     let stride = (width / 8) as usize;
 
+    let mut any_change = false;
     let mut min_byte_col = u8::MAX;
     let mut max_byte_col = 0;
     let mut min_y = u16::MAX;
@@ -60,6 +61,7 @@ pub fn calculate_dirty_area(buffer: &[u8], width: u32) -> Option<DirtyRect> {
         }
 
         if row_has_change {
+            any_change = true;
             let y = y as u16;
             if y < min_y {
                 min_y = y;
@@ -70,7 +72,11 @@ pub fn calculate_dirty_area(buffer: &[u8], width: u32) -> Option<DirtyRect> {
         }
     }
 
-    if max_byte_col == 0 && max_y == 0 {
+    // `0` is a valid coordinate for both `max_byte_col` and `max_y`, so it can't
+    // double as a "nothing changed" sentinel: a change confined to the top-left
+    // corner (byte column 0, row 0) would be reported as a clean buffer and the
+    // frame would never be pushed to the panel. Track emptiness explicitly.
+    if !any_change {
         None
     } else {
         Some(DirtyRect {
